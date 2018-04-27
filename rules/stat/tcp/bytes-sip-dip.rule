@@ -1,0 +1,183 @@
+# *****************************************************************************
+# 统计 sip-dip 之间的流量信息.
+#
+# 作者: ZHANG Li Dan <idan.zhang@clearclouds-global.com>
+# *****************************************************************************
+import "stat/tcp/cfg/bytes-sip-dip.rule";  # 导入规则配置文件.
+
+
+# =============================================================================
+# 数据缓存操作.
+#
+# 第一次执行脚本缓存不存在时, 初始化缓存数据. 缓存数据说明:
+# flag: 报警数据已发送标识.
+# data: 缓存数据, 以 sip+dip 作为 KEY 的字典.
+# =============================================================================
+
+
+# 返回以 __session__ 为 KEY 的缓存数据.
+def session_get() {
+	dict = get_session(__session__);
+
+	if !dict {
+		dict = { "output": false, "data": {}};
+		set_session(__session__, dict);
+	}
+
+	return dict;
+}
+
+
+# 返回缓存数据中 "flag" 和 "data" 的值.
+def session_getFlag() { return session_get()["flag"]; }
+def session_getData()  { return session_get()["data"]; }
+
+
+# 设置以 __session__ 为 KEY 的缓存数据.
+def session_set(value) {
+	set_session(__session__, value);
+}
+
+
+# 设置缓存数据中 "flag" 的值.
+def session_setFlag(value) {
+	dict = session_get();
+	dict["flag"] = value;
+	session_set(dict);
+}
+
+
+# 设置缓存数据中 "data" 的值.
+def session_setData(value) {
+	if !value { value = {}; }
+
+	dict = session_get();
+	dict["data"] = value;
+	session_set(dict);
+
+	return value;
+}
+
+
+# =============================================================================
+# session_append() - 追加数据到缓存中.
+# =============================================================================
+def session_append(list) {
+	dict = session_getData();    # 获取缓存中的原始数据.
+
+	# 以 sip + dip 为 KEY 统计 总字节数, 最大 bps 及最大 bps 对应的时间戳.
+	for item in list {
+		key   = item["sip"] + item["dip"];
+		bps   = (item["bytes"] * 8) / __interval__;
+		time  = time("T");
+
+		if dict[key] {
+			# 统计总 bytes.
+			dict[key]["bytes"] = dict[key]["bytes"] + item["bytes"];
+
+			# 记录 bps 的最大值与最大值发生时的时间戳.
+			if bps > dict[key]["bps_max"] {
+				dict[key]["bps_max"]  = bps;
+				dict[key]["time_max"] = time;
+			}
+		} else {
+			dict[key] = {
+				"sip":     item["sip"],
+				"dip":     item["dip"],
+				"bytes":   item["bytes"],
+				"bps_max": bps,
+				"time_max":    time
+			};
+		}
+	}
+
+	return session_setData(dict);
+}
+
+
+# =============================================================================
+# make_sqlfilter() - 动态生成 SQL 查询语句.
+# =============================================================================
+def make_sqlfilter() {
+	list = [ "last(%(__range__))" ];
+
+	# 根据有效时间配置, 增加 IP 过滤条件.
+	# sip 或者 dip 在 __iplist_copy__ 列表内的记录不统计.
+	if check_datetime(__dt_copy__) {
+		list = append(
+			list,
+			"NOT (sip IN $(__iplist_copy__) OR dip IN $(__iplist_copy__))"
+		);
+	}
+
+	# 生成并返回 SQL 查询语句.
+	return join(list, " AND ");
+}
+
+
+# =============================================================================
+# query_last() - 查询过去一段时间的数据.
+# =============================================================================
+def query_last() {
+	filter = make_sqlfilter();    # 动态生成过滤条件.
+
+	sql = "
+		SELECT    SUM(inbyte + outbyte) AS bytes
+		FROM      'tcp-*'
+		WHERE     %(filter)
+		GROUP BY  sip, dip
+		ORDER BY  bytes
+		LIMIT     20, 20
+	";
+
+	return query(sql);
+}
+
+
+# =============================================================================
+# send_stat() - 输出统计数据.
+# =============================================================================
+def send_stat(dict) {
+	list = values(dict); # 取字典中的所有记录, 生成列表(数组).
+
+	# 排序/截取 TOP N.
+	if __sort_key__ { list = sort_r(list, __sort_key__); }
+	if __topn__ > 0 { list = slice(list, 0, __topn__);   }
+
+	# 数组中每一个元素增加 @timestamp 域, 标识为当前时间生成的数据.
+	item_set(list, "@timestamp", time("T"));
+
+	# 输出 EMAIL 中的字段顺序.
+	__fields__ = [ "sip", "dip", "bytes", "bps_max", "time_max" ];
+
+	alert(list);
+}
+
+
+# =============================================================================
+# main() - 规则入口函数.
+# =============================================================================
+def main() {
+	list = query_last();         # 查询数据.
+	dict = session_append(list); # 追加数据至缓存.
+
+	# 检查当前是否为数据输出时间段.
+	# 当前输出时间段内, 数据只发送一次, 由缓存数据 "flag" 控制.
+	if check_datetime(__dt_output__) {
+		if !session_getFlag() {
+			send_stat(dict);  # 输出统计数据.
+			session_setFlag(true);
+		}
+	} else {
+		print("Not send", time());
+		# 清除数据输出标识.
+		session_setFlag(false);
+	}
+}
+
+
+# =============================================================================
+# 启动/执行规则.
+# =============================================================================
+main();
+
